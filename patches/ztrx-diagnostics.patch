@@ -1,0 +1,359 @@
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index cb57a59f989dfa21eb6bbd0b60abe2042c5041fe..04c3a9434645fc9d0097a5f0c7e462b29e366f51 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -5681,6 +5681,20 @@ impl Meter {
+         late_line(frames);
+         card_clock_line(frames, ms);
+         crate::shadow::back_line(frames);
++        #[cfg(feature = "diagnostics")]
++        for (site, (count, [wait, held, unmap, install_os, install_gpu], [alias_pages, same_view_pages, adjacent_section_pages])) in ["physical_pages", "alias"]
++            .into_iter()
++            .zip(crate::watch::take_remap_timing())
++        {
++            if count > 0 {
++                tracing::info!(site, count, frames, wait_ms = wait.as_secs_f64() * 1e3,
++                    held_ms = held.as_secs_f64() * 1e3, unmap_ms = unmap.as_secs_f64() * 1e3,
++                    install_os_ms = install_os.as_secs_f64() * 1e3,
++                    install_gpu_ms = install_gpu.as_secs_f64() * 1e3,
++                    alias_pages, same_view_pages, adjacent_section_pages,
++                    "title remap writer timing (interval totals)");
++            }
++        }
+         {
+             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+             if passes + compares > 0.0 {
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index db53f110b164caf2423463b81e553fa4f79bea24..37503c0353c436215ae95ef5deee8f8609788017 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -62,5 +62,6 @@ pub use host::on_failure;
+ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+ #[cfg(windows)]
+ pub use watch::{
+-    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
++    RemapSite, Remapping, title_memory_reading, title_memory_remapped, title_memory_remapping,
++    writing as kernel_will_write,
+ };
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index 60ed05c0c9b169535aff1256cc3443c9ada8dbcc..e5f5618f6a97320da9fbc8257566b7b1bcf87d85 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -284,13 +284,36 @@ pub(crate) fn builder_off(why: &'static str) {
+ #[cfg(windows)]
+ pub(crate) fn builder_runs() -> bool {
+     static ALLOWED: OnceLock<bool> = OnceLock::new();
+-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
++    #[cfg(feature = "diagnostics")]
++    let check_only = {
++        static CHECK: OnceLock<bool> = OnceLock::new();
++        *CHECK.get_or_init(|| std::env::var_os("VICTORY_BVH_CHECK").is_some_and(|v| v == "1"))
++    };
++    #[cfg(not(feature = "diagnostics"))]
++    let check_only = false;
++    if !check_only && !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+         return false;
+     }
+     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+     if b.off {
+         return false;
+     }
++    #[cfg(feature = "diagnostics")]
++    if check_only {
++        if !b.whole {
++            let mut missing = 0;
++            for p in &b.pipelines {
++                if !make::now(p) {
++                    missing += 1;
++                    tracing::warn!(reason = ?make::missing(p), "BVH check: pipeline unavailable");
++                }
++            }
++            tracing::info!(missing, total = b.pipelines.len(), "BVH check: creation only; dispatch disabled");
++            // hand_out clears this when a new stage is registered.
++            b.whole = true;
++        }
++        return false;
++    }
+     if b.whole {
+         return true;
+     }
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index 60089a7e825f74e6f15ba26f8c790391208bf638..05de372c71f49f2bffdffb3e5fae4a379064280c 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -601,16 +601,122 @@ pub fn writing(at: usize, len: usize) {
+ /// does.
+ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+ 
++/// Call site for memory-remapping diagnostics.
++#[derive(Clone, Copy)]
++pub enum RemapSite {
++    PhysicalPages,
++    Alias,
++}
++
++#[cfg(feature = "diagnostics")]
++type RemapTiming = (u64, [std::time::Duration; 5], [u64; 3]);
++
++#[cfg(feature = "diagnostics")]
++static REMAP_TIMING: Mutex<[RemapTiming; 2]> =
++    Mutex::new([(0, [std::time::Duration::ZERO; 5], [0; 3]); 2]);
++
++#[cfg(feature = "diagnostics")]
++pub(crate) fn take_remap_timing() -> [RemapTiming; 2] {
++    std::mem::take(&mut *REMAP_TIMING.lock().unwrap_or_else(|e| e.into_inner()))
++}
++
+ /// What the runtime holds while it changes what title memory shows
+ /// ([`title_memory_remapping`]).
+-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
++pub struct Remapping {
++    #[allow(dead_code)]
++    guard: Option<std::sync::RwLockWriteGuard<'static, ()>>,
++    #[cfg(feature = "diagnostics")]
++    timing: Option<(RemapSite, std::time::Instant, std::time::Duration)>,
++    #[cfg(feature = "diagnostics")]
++    unmap_time: std::time::Duration,
++    #[cfg(feature = "diagnostics")]
++    install_time: [std::time::Duration; 2],
++    #[cfg(feature = "diagnostics")]
++    alias_pages: [u64; 3],
++}
++
++impl Remapping {
++    /// Count a mapped page and whether it followed a page of the same source view.
++    #[inline]
++    pub fn record_alias_page(&mut self, _same_view: bool, _adjacent_section_page: bool) {
++        #[cfg(feature = "diagnostics")]
++        if self.timing.is_some() {
++            self.alias_pages[0] += 1;
++            self.alias_pages[1] += u64::from(_same_view);
++            self.alias_pages[2] += u64::from(_adjacent_section_page);
++        }
++    }
++
++    /// Measure new-view installation stages (not the restoration of split views).
++    #[inline]
++    pub fn measure_install<T>(&mut self, gpu_state: bool, operation: impl FnOnce() -> T) -> T {
++        #[cfg(feature = "diagnostics")]
++        if self.timing.is_some() {
++            let start = std::time::Instant::now();
++            let result = operation();
++            self.install_time[usize::from(gpu_state)] += start.elapsed();
++            return result;
++        }
++        let _ = gpu_state;
++        operation()
++    }
++
++    /// Mark the end of the initial unmapping operation without releasing the lock.
++    #[inline]
++    pub fn mark_unmapped(&mut self) {
++        #[cfg(feature = "diagnostics")]
++        if let Some((_, acquired, _)) = self.timing {
++            self.unmap_time = acquired.elapsed();
++        }
++    }
++}
++
++#[cfg(feature = "diagnostics")]
++impl Drop for Remapping {
++    fn drop(&mut self) {
++        if let Some((site, acquired, wait)) = self.timing {
++            let held = acquired.elapsed();
++            drop(self.guard.take());
++            let mut totals = REMAP_TIMING.lock().unwrap_or_else(|e| e.into_inner());
++            let timing = &mut totals[site as usize];
++            timing.0 += 1;
++            for (total, value) in timing.2.iter_mut().zip(self.alias_pages) {
++                *total += value;
++            }
++            for (total, value) in timing.1.iter_mut().zip([wait, held, self.unmap_time, self.install_time[0], self.install_time[1]]) {
++                *total += value;
++            }
++        }
++    }
++}
+ 
+ /// The runtime is about to map, unmap or move physical pages of title
+ /// memory: until what it returns is dropped, no read of title memory in
+ /// place is under way and none begins ([`title_memory_reading`]). Taken
+ /// around the whole change, the unmapping and the mapping again.
+-pub fn title_memory_remapping() -> Remapping {
+-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
++pub fn title_memory_remapping(_site: RemapSite) -> Remapping {
++    #[cfg(feature = "diagnostics")]
++    let started = {
++        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        ENABLED
++            .get_or_init(|| std::env::var_os("VICTORY_REMAP_TIMING").is_some_and(|v| v == "1"))
++            .then(std::time::Instant::now)
++    };
++    let guard = MAPPING.write().unwrap_or_else(|e| e.into_inner());
++    Remapping {
++        guard: Some(guard),
++        #[cfg(feature = "diagnostics")]
++        unmap_time: std::time::Duration::ZERO,
++        #[cfg(feature = "diagnostics")]
++        install_time: [std::time::Duration::ZERO; 2],
++        #[cfg(feature = "diagnostics")]
++        alias_pages: [0; 3],
++        #[cfg(feature = "diagnostics")]
++        timing: started.map(|start| {
++            let acquired = std::time::Instant::now();
++            (_site, acquired, acquired.duration_since(start))
++        }),
++    }
+ }
+ 
+ /// What a read of title memory in place holds ([`title_memory_reading`]).
+@@ -1059,7 +1165,7 @@ mod tests {
+ 
+ #[cfg(test)]
+ mod mapping_tests {
+-    use super::{title_memory_reading, title_memory_remapping};
++    use super::{RemapSite, title_memory_reading, title_memory_remapping};
+     use std::sync::atomic::{AtomicBool, Ordering};
+     use std::sync::{Arc, mpsc};
+     use std::time::Duration;
+@@ -1076,7 +1182,7 @@ mod mapping_tests {
+             let changed = changed.clone();
+             std::thread::spawn(move || {
+                 began.send(()).unwrap();
+-                let _changing = title_memory_remapping();
++                let _changing = title_memory_remapping(RemapSite::PhysicalPages);
+                 changed.store(true, Ordering::SeqCst);
+             })
+         };
+@@ -1088,7 +1194,7 @@ mod mapping_tests {
+         assert!(changed.load(Ordering::SeqCst));
+         // A change holds; the read does not begin until it is done.
+         let read = Arc::new(AtomicBool::new(false));
+-        let changing = title_memory_remapping();
++        let changing = title_memory_remapping(RemapSite::PhysicalPages);
+         let (began, wait) = mpsc::channel();
+         let reader = {
+             let read = read.clone();
+diff --git a/crates/victory-hle/src/modules/xmem.rs b/crates/victory-hle/src/modules/xmem.rs
+index 82e14ef3d054d2011faf5afac8ecea34d7e80925..a16ff6ffb203ecdf24c8b20564b20a06e2e395d5 100644
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -603,8 +603,9 @@ pub extern "system" fn XMemMapPhysicalPages(
+     // maps what stays of them again, and a mapped view is a reservation
+     // until it is committed. A read of title memory in place must not fall
+     // into that gap (`victory_gpu::title_memory_remapping`).
+-    let _changing = victory_gpu::title_memory_remapping();
++    let mut changing = victory_gpu::title_memory_remapping(victory_gpu::RemapSite::PhysicalPages);
+     unmap(&mut physical, base, n * PAGE);
++    changing.mark_unmapped();
+     if pages.is_null() {
+         return address;
+     }
+@@ -626,7 +627,7 @@ pub extern "system" fn XMemMapPhysicalPages(
+                 })
+             })
+             .count();
+-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
++        if !map(&mut physical, base + i * PAGE, run * PAGE, first, Some(&mut changing)) {
+             return std::ptr::null_mut();
+         }
+         i += run;
+@@ -672,35 +673,64 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+     let (to, from, len) = (to as usize, from as usize, len as usize);
+     let mut physical = physical();
+     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
+-    let _changing = victory_gpu::title_memory_remapping();
++    let mut changing = victory_gpu::title_memory_remapping(victory_gpu::RemapSite::Alias);
+     unmap(&mut physical, to, len);
++    changing.mark_unmapped();
++    let mut previous_view = None;
++    let mut next_page_in_section = None;
+     for k in (0..len).step_by(PAGE) {
+         if from == 0 {
+             break;
+         }
+         let at = from + k;
+-        let Some(slice) = physical
++        let Some((&base, (_, source))) = physical
+             .views
+             .range(..=at)
+             .next_back()
+             .filter(|(base, (size, _))| at < *base + size)
+-            .map(|(base, (_, s))| Slice {
+-                index: s.index + (at - base) / PAGE,
+-                section: s.section.clone(),
+-            })
+         else {
+             return false;
+         };
+-        if !map(&mut physical, to + k, PAGE, slice) {
++        let slice = Slice {
++            index: source.index + (at - base) / PAGE,
++            section: source.section.clone(),
++        };
++        let section = slice.section.0 as usize;
++        let index = slice.index;
++        if !map(&mut physical, to + k, PAGE, slice, Some(&mut changing)) {
+             return false;
+         }
++        changing.record_alias_page(previous_view == Some(base), next_page_in_section == Some((section, index)));
++        previous_view = Some(base);
++        next_page_in_section = index.checked_add(1).map(|next| (section, next));
+     }
+     true
+ }
+ 
+ /// Maps `slice` and the slices after it over `[base, base + len)`, which
+ /// must lie in one placeholder.
+-fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
++fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice, mut timing: Option<&mut victory_gpu::Remapping>) -> bool {
++    let install = || install_view(base, len, &slice);
++    let installed = match timing {
++        Some(ref mut timing) => timing.measure_install(false, install),
++        None => install(),
++    };
++    if !installed {
++        return false;
++    }
++    let notify = || {
++        victory_gpu::title_memory_remapped(base, len);
++        victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
++    };
++    match timing {
++        Some(timing) => timing.measure_install(true, notify),
++        None => notify(),
++    }
++    physical.views.insert(base, (len, slice));
++    true
++}
++
++fn install_view(base: usize, len: usize, slice: &Slice) -> bool {
+     // SAFETY: splits the placeholder around the range (failing harmlessly
+     // when the range is the whole placeholder), then maps the section
+     // there; both act only on placeholders.
+@@ -736,11 +766,6 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+         return false;
+     }
+-    // New contents, read-write: the GPU side's copies no longer guard it.
+-    victory_gpu::title_memory_remapped(base, len);
+-    // What the range shows now, for the GPU side's in-place census.
+-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+-    physical.views.insert(base, (len, slice));
+     true
+ }
+ 
+@@ -830,11 +855,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
+             )
+         };
+         if at < base {
+-            map(physical, at, base - at, slice.clone());
++            map(physical, at, base - at, slice.clone(), None);
+         }
+         if at + size > end {
+             let index = slice.index + (end - at) / PAGE;
+-            map(physical, end, at + size - end, Slice { index, ..slice });
++            map(physical, end, at + size - end, Slice { index, ..slice }, None);
+         }
+     }
+ }
