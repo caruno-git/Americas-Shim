@@ -2,14 +2,16 @@
 
 [Русская версия](README.ru.md)
 
-A source-only collection of local Windows graphics compatibility and diagnostics patches for the VIctory family. It is not a standalone runtime or a mirror. Apply each patch to its own base checkout; the two patches are not a stack.
+Two separate Rust source snapshots for Windows graphics compatibility and diagnostics. Build each workspace independently from its own directory. The original patches and helper tools are retained for reference; no patches are required to populate the source trees.
 
-| Patch | Base checkout | Base commit | Scope |
+| Source tree | Upstream base | Base commit | Local changes included |
 | --- | --- | --- | --- |
-| `patches/pareto-nvidia-adapter.patch` | [codec-d/cool_fox](https://github.com/codec-d/cool_fox) | `f4b48ad766ddbec1a1867022cd42f7645b0dd55e` | Opt-in NVIDIA adapter selection (`VICTORY_D3D12_NVIDIA=1`) and adapter logging |
-| `patches/ztrx-diagnostics.patch` | [greyfinch/ztrx](https://gf.openbay.app/greyfinch/ztrx) | `90b529f878a470fec9bf07b7be316bc769a12232` | Remap timing and opt-in, creation-only BVH pipeline diagnostics (`VICTORY_BVH_CHECK=1` in diagnostics builds) |
+| [Pareto](pareto/) | [codec-d/cool_fox](https://github.com/codec-d/cool_fox) | `f4b48ad766ddbec1a1867022cd42f7645b0dd55e` | NVIDIA adapter selection and logging; creation-only BVH diagnostics |
+| [ztrx](ztrx/) | [greyfinch/ztrx](https://gf.openbay.app/greyfinch/ztrx) | `90b529f878a470fec9bf07b7be316bc769a12232` | Remap timing and creation-only BVH diagnostics |
 
-From the matching clean checkout, run `git apply --check <path-to-patch>`, then `git apply <path-to-patch>`. Build using that checkout's instructions.
+Both snapshots retain their workspace manifests, lockfiles, Rust sources, tests and licenses. Runtime files, generated data, local notes and experimental captured fixtures are not included. The BCPack binary table is not distributed; decoding requires an authorized local table supplied through `VICTORY_BCPACK_TABLES`. No ownership is asserted without verification, and the Pareto memory-write diagnostic is excluded. The Pareto launcher requires an explicit executable path (`VICTORY_GAME_EXE`).
+
+The Pareto workspace has a pre-existing build failure: `victory-formats::texture::Layout` does not define `bytes_from`, which the GPU crate calls. No runtime or compatibility testing was performed.
 
 ## Helpers
 
